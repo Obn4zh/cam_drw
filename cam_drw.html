@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Pinch-to-Draw — MediaPipe Hands</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg: #f7f7fb; --card:#fff; --text:#0f172a; --ring: rgba(0,0,0,.06); }
+    *{box-sizing:border-box}
+    body{margin:0;background:linear-gradient(#fafafa,#f2f4f7);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    header,footer,main{max-width:1000px;margin:0 auto;padding:16px}
+    h1{font-size:22px;margin:0}
+    .card{background:var(--card);border:1px solid var(--ring);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.04)}
+    .stage{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:16px;overflow:hidden}
+    video, canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+    video.mirror, canvas.mirror { transform: scaleX(-1); }
+    .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;border-top:1px solid var(--ring);background:#fff}
+    .btn{padding:8px 12px;border-radius:14px;border:1px solid var(--ring);background:#fff;cursor:pointer;font-size:13px}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
+    .btn.active{background:#0f172a;color:#fff;border-color:#0f172a}
+    .chip{padding:4px 8px;font-size:12px;border-radius:999px;background:#fff;border:1px solid var(--ring);box-shadow:0 2px 8px rgba(0,0,0,.05)}
+    .badges{position:absolute;left:8px;top:8px;display:flex;gap:8px;align-items:center;z-index:10}
+    .colors{display:flex;gap:8px}
+    .sw{width:24px;height:24px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.1);cursor:pointer}
+    .divider{width:1px;height:24px;background:#e5e7eb;margin:0 6px}
+    .range{display:flex;align-items:center;gap:6px}
+    footer{color:#94a3b8;font-size:12px}
+    .hint{font-size:12px;color:#64748b;margin-top:8px}
+  </style>
+</head>
+<body>
+  <header>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <h1>Pinch-to-Draw</h1>
+      <div style="display:flex;gap:8px">
+        <button id="toggleCam" class="btn">🎥 Enable camera</button>
+        <button id="toggleMirror" class="btn active">🪞 Mirror ON</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="stage" id="stage">
+        <video id="video" playsinline muted></video>
+        <canvas id="canvas"></canvas>
+
+        <div class="badges">
+          <span id="badgeState" class="chip">Camera off</span>
+          <span id="badgeInit" class="chip" style="display:none;background:#fef9c3;border-color:#fde68a;color:#7c5800">Initializing…</span>
+          <span id="badgeErr"  class="chip" style="display:none;background:#fee2e2;border-color:#fecaca;color:#7f1d1d"></span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="colors" id="colors"></div>
+        <div class="divider"></div>
+        <label class="range">Width
+          <input id="width" type="range" min="1" max="28" step="1" value="6">
+          <span id="widthVal" style="width:2rem;text-align:right">6</span>
+        </label>
+        <div class="divider"></div>
+        <button id="undo" class="btn" disabled>⤺ Undo</button>
+        <button id="clear" class="btn" disabled>🧹 Clear</button>
+        <button id="save" class="btn" disabled>💾 Save</button>
+      </div>
+    </div>
+
+    <p class="hint">Сведите большой и указательный палец — начнётся рисование; разожмите — остановится. Всё локально в браузере.</p>
+  </main>
+
+  <footer>© <span id="year"></span> Pinch-to-Draw.</footer>
+
+  <script type="module">
+    const HANDS_ASSETS_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm";
+    const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task";
+    const COLORS = ["#111827","#ef4444","#f59e0b","#10b981","#3b82f6","#8b5cf6","#ec4899","#f97316"];
+
+    const state = { enabled:false, mirror:true, color:COLORS[0], width:6, strokes:[], isDrawing:false, smoothPoint:null, lastRaw:null };
+    const video=document.getElementById("video"),canvas=document.getElementById("canvas"),stage=document.getElementById("stage");
+    const ctx=canvas.getContext("2d");
+    const toggleCam=document.getElementById("toggleCam"),toggleMirror=document.getElementById("toggleMirror");
+    const colorsEl=document.getElementById("colors"),widthEl=document.getElementById("width"),widthVal=document.getElementById("widthVal");
+    const undoBtn=document.getElementById("undo"),clearBtn=document.getElementById("clear"),saveBtn=document.getElementById("save");
+    const badgeState=document.getElementById("badgeState"),badgeInit=document.getElementById("badgeInit"),badgeErr=document.getElementById("badgeErr");
+    document.getElementById("year").textContent=new Date().getFullYear();
+
+    new ResizeObserver(()=>{const r=stage.getBoundingClientRect();const dpr=window.devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);canvas.style.width=r.width+"px";canvas.style.height=r.height+"px";draw();}).observe(stage);
+
+    for(const c of COLORS){const b=document.createElement("button");b.className="sw";b.style.background=c;b.title=c;b.onclick=()=>state.color=c;colorsEl.appendChild(b);}
+    widthEl.oninput=()=>{state.width=+widthEl.value;widthVal.textContent=widthEl.value;draw();};
+    undoBtn.onclick=()=>{state.strokes.pop();updateBtns();draw();};
+    clearBtn.onclick=()=>{state.strokes=[];updateBtns();draw();};
+    saveBtn.onclick=()=>{const r=stage.getBoundingClientRect();const s=2*(window.devicePixelRatio||1);const off=document.createElement("canvas");off.width=Math.round(r.width*s);off.height=Math.round(r.height*s);const c2=off.getContext("2d");c2.scale(s,s);for(const st of state.strokes){if(st.points.length<2)continue;c2.strokeStyle=st.color;c2.lineWidth=st.width;c2.lineCap=c2.lineJoin="round";c2.beginPath();c2.moveTo(st.points[0].x,st.points[0].y);for(let i=1;i<st.points.length;i++)c2.lineTo(st.points[i].x,st.points[i].y);c2.stroke();}const url=off.toDataURL();const a=document.createElement("a");a.href=url;a.download="draw.png";a.click();};
+    function updateBtns(){const has=state.strokes.length;undoBtn.disabled=clearBtn.disabled=saveBtn.disabled=!has;}
+
+    toggleMirror.onclick=()=>{state.mirror=!state.mirror;toggleMirror.classList.toggle("active",state.mirror);toggleMirror.textContent=state.mirror?"🪞 Mirror ON":"↔️ Mirror OFF";video.classList.toggle("mirror",state.mirror);canvas.classList.toggle("mirror",state.mirror);};
+
+    function draw(p){const dpr=window.devicePixelRatio||1;ctx.clearRect(0,0,canvas.width,canvas.height);ctx.save();ctx.scale(dpr,dpr);for(const st of state.strokes){if(st.points.length<2)continue;ctx.strokeStyle=st.color;ctx.lineWidth=st.width;ctx.lineCap=ctx.lineJoin="round";ctx.beginPath();ctx.moveTo(st.points[0].x,st.points[0].y);for(let i=1;i<st.points.length;i++)ctx.lineTo(st.points[i].x,st.points[i].y);ctx.stroke();}if(p){ctx.fillStyle=state.color+"80";ctx.beginPath();ctx.arc(p.x,p.y,Math.max(2,state.width/2),0,Math.PI*2);ctx.fill();}ctx.restore();}
+
+    const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+    const ema=(pr,n,a)=>!pr?n:{x:pr.x+a*(n.x-pr.x),y:pr.y+a*(n.y-pr.y)};
+
+    function landmarkToStagePx(normX, normY, videoEl, stageEl) {
+      const vw = videoEl.videoWidth || 640;
+      const vh = videoEl.videoHeight || 480;
+      const r = stageEl.getBoundingClientRect();
+      const cw = r.width, ch = r.height;
+      const scale = Math.max(cw / vw, ch / vh);
+      const renderW = vw * scale, renderH = vh * scale;
+      const ox = (cw - renderW) / 2, oy = (ch - renderH) / 2;
+      return { x: ox + normX * renderW, y: oy + normY * renderH };
+    }
+
+    let detector=null,raf=0;
+    async function ensureDet(){if(detector)return detector;const vision=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8");const {FilesetResolver,HandLandmarker}=vision;const res=await FilesetResolver.forVisionTasks(HANDS_ASSETS_BASE);detector=await HandLandmarker.createFromOptions(res,{baseOptions:{modelAssetPath:MODEL_URL},runningMode:"VIDEO",numHands:1});return detector;}
+
+    async function startCam(){if(state.enabled)return;badgeErr.style.display="none";badgeInit.style.display="";try{const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user"},audio:false});video.srcObject=s;await video.play();state.enabled=true;toggleCam.textContent="⏸️ Camera";badgeState.textContent="Ready";await ensureDet();loop();}catch(e){badgeErr.textContent=e.name==="NotAllowedError"?"Доступ к камере запрещён":e.message;badgeErr.style.display="";}finally{badgeInit.style.display="none";}updateBtns();}
+    function stopCam(){const s=video.srcObject;s?.getTracks().forEach(t=>t.stop());video.srcObject=null;state.enabled=false;cancelAnimationFrame(raf);toggleCam.textContent="🎥 Enable camera";badgeState.textContent="Camera off";}
+    toggleCam.onclick=()=>{state.enabled?stopCam():startCam();};
+
+    function loop(){
+      if(video.readyState>=2&&detector){
+        const res=detector.detectForVideo(video,performance.now());
+        if(res.landmarks?.length){
+          const l=res.landmarks[0];
+          const tp=landmarkToStagePx(l[4].x,l[4].y,video,stage);
+          const ip=landmarkToStagePx(l[8].x,l[8].y,video,stage);
+          const m={x:(tp.x+ip.x)/2,y:(tp.y+ip.y)/2};
+          const r=stage.getBoundingClientRect();
+          const d=dist(tp,ip)/Math.min(r.width,r.height);
+          if(!state.isDrawing&&d<=0.04){state.isDrawing=true;state.strokes.push({color:state.color,width:state.width,points:[]});updateBtns();badgeState.textContent="Drawing";}
+          else if(state.isDrawing&&d>=0.06){state.isDrawing=false;badgeState.textContent="Ready";}
+          const sp=ema(state.smoothPoint,m,0.3);state.smoothPoint=sp;
+          if(state.isDrawing){const last=state.strokes[state.strokes.length-1];const lastPt=last.points[last.points.length-1];if(!lastPt||dist(lastPt,sp)>0.5)last.points.push(sp);}draw(sp);
+        } else {state.isDrawing=false;draw();}
+      }
+      raf=requestAnimationFrame(loop);
+    }
+  </script>
+</body>
+</html>
